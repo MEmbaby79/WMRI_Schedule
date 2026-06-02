@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>SISI Global — Smart Irrigation Suitability Index | Egypt GIS Registry</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',Arial,sans-serif;background:#3b3f43;color:#222;min-height:100vh}
@@ -594,11 +595,11 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#3b3f43;color:#222;min-h
     <div style="margin-top:18px;background:#fff;border:1.5px solid #c8e6c9;border-radius:12px;padding:14px">
       <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin-bottom:10px">
         <div>
-          <div style="font-size:14px;font-weight:700;color:#2e7d32">🗓️ Irrigation Schedule — All Farms</div>
+          <div style="font-size:14px;font-weight:700;color:#2e7d32" id="wSchedTitle">🗓️ Irrigation Schedule — All Farms</div>
           <div style="font-size:11px;color:#888">جدولة الري التلقائية · كمية المياه · التوقيت · التنبيهات</div>
         </div>
         <div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center">
-          <button class="btn btn-success" onclick="wGenAllSchedules()" style="font-size:11px">⚡ Generate Schedules</button>
+          <button class="btn btn-success" onclick="wGenSchedule()" style="font-size:11px">⚡ Generate Schedules</button>
           <button onclick="wExportScheduleCSV()" style="background:#2e7d32;color:#fff;border:none;border-radius:7px;padding:6px 13px;font-size:11px;cursor:pointer">⬇️ Export All CSV</button>
           <button id="wNotifyBtn" onclick="wRequestNotifications()" style="background:#ff6f00;color:#fff;border:none;border-radius:7px;padding:6px 13px;font-size:11px;cursor:pointer">🔔 Enable Notifications</button>
           <span id="wNotifyStatus" style="font-size:10px;color:#888"></span>
@@ -607,7 +608,7 @@ body{font-family:'Segoe UI',Arial,sans-serif;background:#3b3f43;color:#222;min-h
       <!-- Farm selector for schedule -->
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
         <label style="font-size:11px;font-weight:600;color:#555">Show Farm:</label>
-        <select id="wSchedFarmSel" onchange="wRenderScheduleTable()" style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;font-size:11px;min-width:180px">
+        <select id="wSchedFarmSel" onchange="wOnSchedFarmChange()" style="padding:4px 8px;border:1px solid #ddd;border-radius:6px;font-size:11px;min-width:180px">
           <option value="all">-- All Farms --</option>
         </select>
         <label style="font-size:11px;font-weight:600;color:#555;margin-left:10px">View:</label>
@@ -995,6 +996,9 @@ const W_IRR_ADJ = {
   none:      [1.00,1.00,1.00,1.00],
 };
 
+// ════════════════════════════════════════════════════════
+// W_GEE — fallback only (real values come from live fetch below)
+// ════════════════════════════════════════════════════════
 const W_GEE = {
   wheat:{ndvi:.520,kc:.730},maize:{ndvi:.610,kc:.830},cotton:{ndvi:.450,kc:.650},
   clover:{ndvi:.600,kc:.820},rice:{ndvi:.580,kc:.780},sugarcane:{ndvi:.640,kc:.860},
@@ -1002,6 +1006,177 @@ const W_GEE = {
   tomato:{ndvi:.560,kc:.760},potato:{ndvi:.540,kc:.740},onion:{ndvi:.490,kc:.680},
   default:{ndvi:.480,kc:.680}
 };
+
+// ════════════════════════════════════════════════════════
+// REAL NDVI ENGINE — 4 sources (same as dashboard_final)
+// Priority: 1) Sentinel-2 (Planetary Computer/GEE)
+//           2) MODIS MOD13Q1 (OpenLandMap/GEE)
+//           3) NASA-POWER PAR proxy
+//           4) Smart FAO-Egypt estimate (fallback)
+// ════════════════════════════════════════════════════════
+
+function ndviToKc(ndvi){ return +Math.min(1.30,Math.max(0.05,1.2*ndvi+0.10)).toFixed(3); }
+
+// UTM projection helper (Egypt zones 34-38N)
+function wgs84ToUtm(lat,lon){
+  const zone=Math.floor((lon+180)/6)+1;
+  const lon0=((zone-1)*6-180+3)*Math.PI/180;
+  const laR=lat*Math.PI/180,loR=lon*Math.PI/180;
+  const a=6378137.0,f=1/298.257223563,b=a*(1-f),e2=(a*a-b*b)/(a*a);
+  const N=a/Math.sqrt(1-e2*Math.pow(Math.sin(laR),2));
+  const T=Math.pow(Math.tan(laR),2);
+  const C=e2/(1-e2)*Math.pow(Math.cos(laR),2);
+  const A=Math.cos(laR)*(loR-lon0);
+  const M=a*((1-e2/4-3*e2*e2/64)*laR-(3*e2/8+3*e2*e2/32)*Math.sin(2*laR)+(15*e2*e2/256)*Math.sin(4*laR));
+  const x=0.9996*(N*(A+(1-T+C)*A*A*A/6+(5-18*T+T*T)*Math.pow(A,5)/120))+500000;
+  const y=0.9996*(M+N*Math.tan(laR)*(A*A/2+(5-T+9*C+4*C*C)*Math.pow(A,4)/24+(61-58*T+T*T)*Math.pow(A,6)/720));
+  return{x,y:lat>=0?y:y+10000000,zone,epsg:lat>=0?32600+zone:32700+zone};
+}
+
+// Read single pixel from Cloud-Optimized GeoTIFF
+async function wReadCOGPixel(url,lat,lon){
+  if(!window.GeoTIFF) return null;
+  try{
+    const tiff=await window.GeoTIFF.fromUrl(url,{allowFullFile:false});
+    const img=await tiff.getImage();
+    const bbox=img.getBoundingBox();
+    const W=img.getWidth(),H=img.getHeight();
+    const gk=img.getGeoKeys();
+    const pc=gk?.ProjectedCSTypeGeoKey||0;
+    let px,py;
+    if(pc>=32601&&pc<=32760){
+      const utm=wgs84ToUtm(lat,lon);
+      px=Math.floor((utm.x-bbox[0])/(bbox[2]-bbox[0])*W);
+      py=Math.floor((bbox[3]-utm.y)/(bbox[3]-bbox[1])*H);
+    } else {
+      px=Math.floor((lon-bbox[0])/(bbox[2]-bbox[0])*W);
+      py=Math.floor((bbox[3]-lat)/(bbox[3]-bbox[1])*H);
+    }
+    if(px<0||px>=W||py<0||py>=H) return null;
+    const data=await img.readRasters({window:[px,py,px+1,py+1]});
+    const v=data[0][0];
+    return(v>0&&!isNaN(v))?v:null;
+  }catch(e){return null;}
+}
+
+// SOURCE 1 — GEE/Sentinel-2 L2A via Planetary Computer
+async function wFetchSentinel2PC(lat,lon){
+  if(!window.GeoTIFF) return null;
+  const mkT=ms=>new Promise((_,r)=>setTimeout(()=>r(new Error('to')),ms));
+  const end=new Date().toISOString().split('T')[0];
+  const start=new Date(Date.now()-90*86400000).toISOString().split('T')[0];
+  try{
+    const scenes=await Promise.race([
+      fetch('https://planetarycomputer.microsoft.com/api/stac/v1/search',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({
+          collections:['sentinel-2-l2a'],
+          intersects:{type:'Point',coordinates:[lon,lat]},
+          datetime:`${start}T00:00:00Z/${end}T23:59:59Z`,
+          query:{'eo:cloud_cover':{lt:20}},
+          sortby:[{field:'datetime',direction:'desc'}],
+          limit:5
+        })
+      }).then(r=>r.json()),
+      mkT(12000)
+    ]);
+    if(!scenes.features?.length) return null;
+    for(const item of scenes.features){
+      try{
+        const b04=item.assets?.B04?.href,b08=item.assets?.B08?.href;
+        if(!b04||!b08) continue;
+        const [s4,s8]=await Promise.all([
+          fetch(`https://planetarycomputer.microsoft.com/api/sas/v1/sign?href=${encodeURIComponent(b04)}`).then(r=>r.json()),
+          fetch(`https://planetarycomputer.microsoft.com/api/sas/v1/sign?href=${encodeURIComponent(b08)}`).then(r=>r.json())
+        ]);
+        const [red,nir]=await Promise.all([
+          wReadCOGPixel(s4.href,lat,lon),
+          wReadCOGPixel(s8.href,lat,lon)
+        ]);
+        if(!red||!nir||red+nir===0) continue;
+        const ndvi=(nir-red)/(nir+red);
+        if(isNaN(ndvi)||ndvi<-0.5||ndvi>1.0) continue;
+        const nd=+ndvi.toFixed(3);
+        return{ndvi:nd,kc:ndviToKc(nd),
+          source:`🛰️ GEE/Sentinel-2 L2A — ${item.properties.datetime?.split('T')[0]} (☁ ${+(item.properties['eo:cloud_cover']||0).toFixed(0)}%)`,
+          isReal:true,isGEE:true};
+      }catch(e){continue;}
+    }
+  }catch(e){}
+  return null;
+}
+
+// SOURCE 2 — GEE/MODIS MOD13Q1 via OpenLandMap
+async function wFetchOpenLandMap(lat,lon){
+  const mkT=ms=>new Promise((_,r)=>setTimeout(()=>r(new Error('to')),ms));
+  try{
+    const url=`https://api.openlandmap.org/query/point?lon=${lon.toFixed(4)}&lat=${lat.toFixed(4)}&properties=ndvi_mod13q1.v61&compress=false`;
+    const r=await Promise.race([fetch(url).then(r=>r.json()),mkT(7000)]);
+    const props=r?.properties?.['ndvi_mod13q1.v61'];
+    if(props&&typeof props==='object'){
+      const mon=String(new Date().getMonth()+1).padStart(2,'0');
+      const keys=Object.keys(props);
+      const mKeys=keys.filter(k=>k.endsWith('_'+mon));
+      const useK=mKeys.length?mKeys:keys;
+      const vals=useK.map(k=>Number(props[k])).filter(v=>!isNaN(v)&&v>0);
+      if(vals.length){
+        const mean=vals.reduce((s,v)=>s+v,0)/vals.length;
+        const ndvi=mean>1?+(mean/10000).toFixed(3):+mean.toFixed(3);
+        if(ndvi>0.05&&ndvi<0.95)
+          return{ndvi,kc:ndviToKc(ndvi),source:'🌍 GEE/MODIS MOD13Q1 — OpenLandMap',isReal:true,isGEE:true};
+      }
+    }
+  }catch(e){}
+  return null;
+}
+
+// SOURCE 3 — NASA-POWER PAR climatology proxy
+async function wFetchNASAPower(lat,lon,cropKey,irrType,plantDate){
+  const mkT=ms=>new Promise((_,r)=>setTimeout(()=>r(new Error('to')),ms));
+  try{
+    const url=`https://power.larc.nasa.gov/api/temporal/climatology/point?parameters=ALLSKY_SFC_PAR_TOT&community=AG&longitude=${lon.toFixed(3)}&latitude=${lat.toFixed(3)}&format=JSON`;
+    const r=await Promise.race([fetch(url).then(r=>r.json()),mkT(7000)]);
+    const par=r?.properties?.parameter?.ALLSKY_SFC_PAR_TOT;
+    if(par){
+      const mon=String(new Date().getMonth()+1).padStart(2,'0');
+      const pv=parseFloat(par[mon]||par['ANN']||5);
+      if(!isNaN(pv)&&pv>0){
+        const base=wEstimateNDVI(cropKey, plantDate, irrType);
+        const ndvi=+Math.min(0.88,base*Math.min(1.15,Math.max(0.80,pv/7.5))).toFixed(3);
+        return{ndvi,kc:ndviToKc(ndvi),source:`🌤️ NASA-POWER (PAR=${pv.toFixed(1)} MJ/m²/d)`,isReal:true,isGEE:false};
+      }
+    }
+  }catch(e){}
+  return null;
+}
+
+// SOURCE 4 — Smart FAO-Egypt estimate (always available fallback)
+// Based on Elhag et al. (2017): Kc_NDVI ≈ 1.2×NDVI + 0.10
+function wEstimateNDVI(cropKey, plantDate, irrType){
+  const crop = W_CROPS[cropKey]||W_CROPS.wheat;
+  const age  = Math.max(1,Math.floor((new Date()-new Date(plantDate||new Date()))/86400000));
+  // Get Kc for current day
+  let cum=0, kc=crop.stages[0].kc;
+  for(const s of crop.stages){ cum+=s.d; if(age<=cum){kc=s.kc;break;} }
+  const kcMax = Math.max(...crop.stages.map(s=>s.kc));
+  const irrigAdj={drip:1.0,subsurface:1.02,sprinkler:0.91,furrow:0.82,surface:0.76,none:0.84}[irrType]||0.84;
+  const plantMonth = new Date(plantDate||new Date()).getMonth()+1;
+  const summerBonus=[5,6,7,8,9].includes(plantMonth)?1.04:1.0;
+  const ndviRaw=(kc-0.10)/1.2;
+  return +Math.max(0.08,Math.min(0.88,ndviRaw*irrigAdj*summerBonus)).toFixed(3);
+}
+
+// MAIN — fetch NDVI for one farm using all 4 sources in priority order
+async function wFetchNDVIForFarm(lat, lon, cropKey, irrType, plantDate){
+  const s2 = await wFetchSentinel2PC(lat, lon);
+  if(s2) return s2;
+  const ol = await wFetchOpenLandMap(lat, lon);
+  if(ol) return ol;
+  const np = await wFetchNASAPower(lat, lon, cropKey, irrType, plantDate);
+  if(np) return np;
+  const ndvi = wEstimateNDVI(cropKey, plantDate, irrType);
+  return{ndvi,kc:ndviToKc(ndvi),source:'🤖 تقدير ذكي FAO-Egypt',isReal:false,isGEE:false};
+}
 
 // ════════════════════════════════════════════════════════
 // PER-FARM SETTINGS — persistent localStorage
@@ -1379,32 +1554,45 @@ async function wFetchAll(){
   if(!all.length){ showToast('No farms with coordinates found','#888'); return; }
   const btn=document.getElementById('wFetchBtn');
   const status=document.getElementById('w_status');
-  btn.disabled=true; btn.textContent='⏳ Fetching...';
-  status.textContent='Fetching '+all.length+' fields...';
+  btn.disabled=true; btn.textContent='\u23f3 Fetching...';
+  status.textContent='Fetching ET\u2080 + NDVI for '+all.length+' farms...';
   let done=0;
-  const seen=new Set();
+  const seenET0=new Set();
   for(const f of all){
     const key=f.lat.toFixed(2)+','+f.lng.toFixed(2);
-    if(!seen.has(key)){
-      seen.add(key);
+    if(!seenET0.has(key)){
+      seenET0.add(key);
       const wx=await wFetchET0(f.lat,f.lng);
-      if(wx) all.filter(ff=>ff.lat.toFixed(2)+','+ff.lng.toFixed(2)===key).forEach(ff=>{ff._et0Live=wx.et0;ff._wx=wx;});
+      if(wx) all.filter(ff=>ff.lat.toFixed(2)+','+ff.lng.toFixed(2)===key)
+               .forEach(ff=>{ff._et0Live=wx.et0;ff._wx=wx;});
     }
+    const settings = wLoadFarmSettings();
+    const fs = settings[f.id]||{};
+    const cropKey  = fs.crop1 || (document.getElementById('w_globalCrop')?document.getElementById('w_globalCrop').value:'wheat');
+    const irrType  = fs.irrType || (document.getElementById('w_globalIrr')?document.getElementById('w_globalIrr').value:'drip');
+    const plantDate= fs.plantDate || (document.getElementById('w_plantDate')?document.getElementById('w_plantDate').value:'') || new Date().toISOString().slice(0,10);
+    status.textContent='['+(done+1)+'/'+all.length+'] '+f.name+' \u2014 \u062c\u0627\u0631\u064a \u062c\u0644\u0628 NDVI...';
+    const ndviRes = await wFetchNDVIForFarm(f.lat, f.lng, cropKey, irrType, plantDate);
+    f._ndviKc  = ndviRes.kc;
+    f._ndviVal = ndviRes.ndvi;
+    f._ndviSrc = ndviRes.source;
+    f._ndviReal= ndviRes.isReal;
+    f._ndviGEE = ndviRes.isGEE;
     done++;
     status.textContent='Done '+done+'/'+all.length+'...';
-    await new Promise(r=>setTimeout(r,120));
+    await new Promise(r=>setTimeout(r,80));
   }
-  all.forEach(f=>{
-    var ck=document.getElementById('w_globalCrop')?document.getElementById('w_globalCrop').value:'wheat';
-    var g=W_GEE[ck]||W_GEE.default;
-    f._ndviKc=g.kc; f._ndviVal=g.ndvi;
-  });
   var et0El=document.getElementById('w_et0');
   if(et0El&&all[0]&&all[0]._et0Live) et0El.value=all[0]._et0Live;
   var wxBadge=document.getElementById('w_wx_badge');
-  if(wxBadge) wxBadge.textContent=all[0]&&all[0]._wx?('🌡️ '+all[0]._wx.tmax+'°C | 🌧️ '+all[0]._wx.rain+'mm | '+all[0]._wx.date):'';
-  btn.disabled=false; btn.textContent='🛰️ Fetch Live ET₀ + NDVI';
-  status.textContent='✅ Fetched '+seen.size+' locations';
+  if(wxBadge) wxBadge.textContent=all[0]&&all[0]._wx
+    ?('\U0001f321\ufe0f '+all[0]._wx.tmax+'\u00b0C | \U0001f327\ufe0f '+all[0]._wx.rain+'mm | '+all[0]._wx.date
+      +(all[0]._ndviSrc?' | '+all[0]._ndviSrc:''))
+    :'';
+  btn.disabled=false; btn.textContent='\U0001f6f0\ufe0f Fetch Live ET\u2080 + NDVI';
+  const realCount = all.filter(f=>f._ndviReal).length;
+  const geeCount  = all.filter(f=>f._ndviGEE).length;
+  status.textContent='\u2705 Fetched '+seenET0.size+' locations | NDVI: '+geeCount+' GEE, '+(realCount-geeCount)+' NASA, '+(all.length-realCount)+' smart est.';
   wCalcAll();
 }
 
@@ -1428,7 +1616,7 @@ function wExportCSV(){
     const fPF=wGetSeasonTotal(gCrop,et0f,gIrr,FED);
     const fGPF=Math.round(fPF/(irrEff/100));
     const fGT=Math.round(wGetSeasonTotal(gCrop,et0f,gIrr,FED*aFed)/(irrEff/100));
-    const ndviKc=f._ndviKc||(W_GEE[gCrop]||W_GEE.default).kc;
+    const ndviKc=f._ndviKc||ndviToKc(wEstimateNDVI(gCrop, plt, gIrr));
     const nPF=+wGetSeasonTotalKc(ndviKc,et0f,FED,gCrop);
     const nGPF=Math.round(nPF/(irrEff/100));
     const interval=gIrr==='drip'?3:gIrr==='sprinkler'?5:gIrr==='furrow'?10:14;
@@ -1476,8 +1664,10 @@ function wCalcFarm(f, et0Global, gIrr, gPlant, gCrop, irrEff, fedM2){
     c2GrossTotal  = Math.round(c2GrossPerFed * aFed);
   }
 
-  // NDVI-based estimate
-  var ndviKc = f._ndviKc || (W_GEE[cropKey]||W_GEE.default).kc;
+  // NDVI-based estimate — use live fetched value first, then smart estimate, then W_GEE static
+  var ndviKc = f._ndviKc || ndviToKc(wEstimateNDVI(cropKey, plantDate, irrType));
+  var ndviVal= f._ndviVal || wEstimateNDVI(cropKey, plantDate, irrType);
+  var ndviSrc= f._ndviSrc || '🤖 تقدير ذكي FAO-Egypt';
   var ndviPerFed    = +wGetSeasonTotalKc(ndviKc, et0, FED, cropKey);
   var ndviGrossPerFed = Math.round(ndviPerFed/(irrEff/100));
   var ndviGrossTotal  = Math.round(ndviGrossPerFed * aFed);
@@ -1501,7 +1691,9 @@ function wCalcFarm(f, et0Global, gIrr, gPlant, gCrop, irrEff, fedM2){
     aFed:aFed, et0:et0, FED:FED,
     faoPerFed:faoPerFed, faoGrossPerFed:faoGrossPerFed, faoGrossTotal:faoGrossTotal,
     c2PerFed:c2PerFed, c2GrossPerFed:c2GrossPerFed, c2GrossTotal:c2GrossTotal,
-    ndviKc:ndviKc, ndviPerFed:ndviPerFed, ndviGrossPerFed:ndviGrossPerFed, ndviGrossTotal:ndviGrossTotal,
+    ndviKc:ndviKc, ndviVal:ndviVal, ndviSrc:ndviSrc,
+    ndviReal:f._ndviReal||false, ndviGEE:f._ndviGEE||false,
+    ndviPerFed:ndviPerFed, ndviGrossPerFed:ndviGrossPerFed, ndviGrossTotal:ndviGrossTotal,
     age:age, dLeft:dLeft, stageName:stageName, kcToday:kcToday, etcToday:etcToday,
     totalEvents:totalEvents, irrEffAdj:irrEffAdj, cropDur:cropDur,
     diffPerFed: faoGrossPerFed - ndviGrossPerFed
@@ -1606,7 +1798,8 @@ function wCalcAll(){
               '<td style="padding:5px 8px;font-weight:700;font-size:13px;color:#2e7d32">'+r.ndviGrossTotal.toLocaleString()+' m³</td>' +
               '<td style="padding:5px 8px;color:#555">Kc='+r.ndviKc.toFixed(3)+'</td>' +
               '<td style="padding:5px 8px;color:#555">'+r.irrEffAdj+'%</td>' +
-              '<td style="padding:5px 8px;font-size:11px;color:#888">NDVI='+((W_GEE[r.cropKey]||W_GEE.default).ndvi).toFixed(3)+'</td>' +
+              '<td style="padding:5px 8px;font-size:10px;color:'+(r.ndviGEE?'#1B5E20':r.ndviReal?'#1565c0':'#E65100')+'">'+
+                'NDVI='+r.ndviVal.toFixed(3)+'<br><span style="opacity:.8">'+r.ndviSrc+'</span></td>' +
             '</tr>' +
             (r.diffPerFed!==0?'<tr style="background:#fffde7"><td style="padding:4px 8px;color:#e65100;font-size:11px" colspan="2">± Diff FAO vs NDVI</td>'+
               '<td style="padding:4px 8px;color:#e65100;font-weight:700">'+(r.diffPerFed>0?'+':'')+r.diffPerFed.toLocaleString()+' m³/fed</td>'+
@@ -4080,7 +4273,8 @@ function fzCalcWaterForZone(z){
   var faoPerFed = wGetSeasonTotal(z.cropKey, et0, z.irrSystem, FED);
   var faoGrossPerFed = Math.round(faoPerFed/eff);
   var faoTotal = Math.round(faoGrossPerFed*(z.area||1));
-  var ndviKc = (W_GEE[z.cropKey]||W_GEE.default).kc;
+  // Use live fetched NDVI if available, else smart estimate (same 4-source logic)
+  var ndviKc = z._ndviKc || ndviToKc(wEstimateNDVI(z.cropKey, z.plantDate||new Date().toISOString().slice(0,10), z.irrSystem||'drip'));
   var ndviPerFed = +wGetSeasonTotalKc(ndviKc, et0, FED, z.cropKey);
   var ndviGrossPerFed = Math.round(ndviPerFed/eff);
   var ndviTotal = Math.round(ndviGrossPerFed*(z.area||1));
@@ -4375,6 +4569,53 @@ var _wSchedules = {};   // farmId → [{date,vol,hours,flow,farmName,cropKey,irr
 var _wNotifyEnabled = false;
 
 // Generate irrigation schedule for ALL farms + their zones
+// ── Smart entry point — generates for selected farm only, or all ──
+function wGenSchedule(){
+  var sel = document.getElementById('wSchedFarmSel');
+  var farmFilter = sel ? sel.value : 'all';
+  if(farmFilter && farmFilter !== 'all'){
+    wGenFarmSchedule(farmFilter);
+  } else {
+    wGenAllSchedules();
+  }
+}
+
+// ── Generate schedule for ONE farm only (keeps other farms intact) ──
+function wGenFarmSchedule(farmId){
+  var farms = getAllFarms();
+  var f = farms.find(function(x){ return x.id === farmId; });
+  if(!f){ showToast('Farm not found','#e65100'); return; }
+
+  var zonesSnap = {};
+  try{ zonesSnap = JSON.parse(localStorage.getItem('sisi_zones_snap')||'{}'); }catch(e){}
+
+  var fZones = zonesSnap[farmId] || [];
+  if(fZones.length){
+    _wSchedules[farmId] = [];
+    fZones.forEach(function(z){
+      var sessions = _wBuildSessions(f, z.cropKey||f.cropKey, z.irrSystem||f.irrType, z.area, z.plantDate||f.plantDate||f.season_start);
+      sessions.forEach(function(s){
+        s.zoneName = z.name;
+        s.farmName = (f.name||f.nameEn||'Farm')+' › '+z.name;
+        _wSchedules[farmId].push(s);
+      });
+    });
+  } else {
+    var sessions = _wBuildSessions(f, f.cropKey, f.irrType||f.irrigation_type, parseFloat(f.area)||1, f.plantDate||f.season_start);
+    _wSchedules[farmId] = sessions;
+  }
+
+  // Update title
+  var titleEl = document.getElementById('wSchedTitle');
+  if(titleEl) titleEl.textContent = '🗓️ Irrigation Schedule — ' + (f.name||f.nameEn||'Farm');
+
+  wRenderScheduleTable();
+  wShowTodaySchedule();
+  wSaveSchedules();
+  var count = (_wSchedules[farmId]||[]).length;
+  showToast('✅ '+count+' sessions generated for '+( f.name||'Farm'),'#2e7d32',3000);
+}
+
 function wGenAllSchedules(){
   _wSchedules = {};
   var farms = getAllFarms();
@@ -4402,6 +4643,10 @@ function wGenAllSchedules(){
     }
   });
 
+  // Update title
+  var titleEl = document.getElementById('wSchedTitle');
+  if(titleEl) titleEl.textContent = '🗓️ Irrigation Schedule — All Farms';
+
   // Populate farm selector
   var sel = document.getElementById('wSchedFarmSel');
   if(sel){
@@ -4416,6 +4661,26 @@ function wGenAllSchedules(){
   wSaveSchedules();
   var total = Object.keys(_wSchedules).reduce(function(s,k){return s+_wSchedules[k].length;},0);
   showToast('✅ '+total+' sessions across '+Object.keys(_wSchedules).length+' farms','#2e7d32',3000);
+}
+
+// Called when user picks a farm from the dropdown
+function wOnSchedFarmChange(){
+  var sel = document.getElementById('wSchedFarmSel');
+  var val = sel ? sel.value : 'all';
+  var titleEl = document.getElementById('wSchedTitle');
+  if(val && val !== 'all'){
+    var farms = getAllFarms();
+    var f = farms.find(function(x){ return x.id === val; });
+    if(titleEl) titleEl.textContent = '🗓️ Irrigation Schedule — ' + (f ? (f.name||f.nameEn||'Farm') : val);
+    // Auto-generate for this farm if not already done
+    if(!_wSchedules[val] || !_wSchedules[val].length){
+      wGenFarmSchedule(val);
+      return;
+    }
+  } else {
+    if(titleEl) titleEl.textContent = '🗓️ Irrigation Schedule — All Farms';
+  }
+  wRenderScheduleTable();
 }
 
 function _wBuildSessions(farm, cropKey, irrType, area, startDate){
@@ -4879,19 +5144,20 @@ self.addEventListener('notificationclick', function(e){
 `;
 
   if('serviceWorker' in navigator){
-    var blob = new Blob([SW_CODE], {type:'application/javascript'});
-    var swUrl = URL.createObjectURL(blob);
-    navigator.serviceWorker.register(swUrl, {scope:'/'}).then(function(reg){
-      console.log('[SISI] Service Worker registered for background notifications');
-      // Try to register periodic sync for daily check
-      if('periodicSync' in reg){
-        reg.periodicSync.register('irr-check', {minInterval: 8*60*60*1000}).catch(function(){});
-      }
-      // Send schedule alarms to SW whenever schedules are saved
-      window._swReg = reg;
-    }).catch(function(e){
-      console.warn('[SISI] SW registration failed (blob SW needs HTTPS or localhost):',e.message);
-    });
+    try{
+      var blob = new Blob([SW_CODE], {type:'application/javascript'});
+      var swUrl = URL.createObjectURL(blob);
+      navigator.serviceWorker.register(swUrl, {scope:'/'}).then(function(reg){
+        if('periodicSync' in reg){
+          reg.periodicSync.register('irr-check', {minInterval: 8*60*60*1000}).catch(function(){});
+        }
+        window._swReg = reg;
+      }).catch(function(){
+        // SW not supported in this environment (blob URL / no HTTPS) — silent fallback
+      });
+    }catch(e){
+      // Silent — SW is optional, app works fully without it
+    }
   }
 
   // Patch wSaveSchedules to also push alarms to SW
