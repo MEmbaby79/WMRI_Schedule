@@ -1167,15 +1167,30 @@ function wEstimateNDVI(cropKey, plantDate, irrType){
 }
 
 // MAIN — fetch NDVI for one farm using all 4 sources in priority order
-async function wFetchNDVIForFarm(lat, lon, cropKey, irrType, plantDate){
+// Stores all source results on the farm object for display
+async function wFetchNDVIForFarm(lat, lon, cropKey, irrType, plantDate, farmObj){
+  // Run all 4 sources (parallel where possible, sequential for best UX)
   const s2 = await wFetchSentinel2PC(lat, lon);
-  if(s2) return s2;
   const ol = await wFetchOpenLandMap(lat, lon);
-  if(ol) return ol;
   const np = await wFetchNASAPower(lat, lon, cropKey, irrType, plantDate);
+  const sm_ndvi = wEstimateNDVI(cropKey, plantDate, irrType);
+  const sm = {ndvi:sm_ndvi, kc:ndviToKc(sm_ndvi), source:'🤖 تقدير ذكي FAO-Egypt', isReal:false, isGEE:false};
+
+  // Store all sources on farm object for the panel
+  if(farmObj){
+    farmObj._ndviSources = [
+      {label:'🛰️ Sentinel-2 L2A',  key:'s2',  res: s2 || null},
+      {label:'🌍 MODIS MOD13Q1',    key:'ol',  res: ol || null},
+      {label:'🌤️ NASA-POWER (PAR)', key:'np',  res: np || null},
+      {label:'🤖 Smart FAO-Egypt',  key:'sm',  res: sm}
+    ];
+  }
+
+  // Return best available in priority order
+  if(s2) return s2;
+  if(ol) return ol;
   if(np) return np;
-  const ndvi = wEstimateNDVI(cropKey, plantDate, irrType);
-  return{ndvi,kc:ndviToKc(ndvi),source:'🤖 تقدير ذكي FAO-Egypt',isReal:false,isGEE:false};
+  return sm;
 }
 
 // ════════════════════════════════════════════════════════
@@ -1572,7 +1587,7 @@ async function wFetchAll(){
     const irrType  = fs.irrType || (document.getElementById('w_globalIrr')?document.getElementById('w_globalIrr').value:'drip');
     const plantDate= fs.plantDate || (document.getElementById('w_plantDate')?document.getElementById('w_plantDate').value:'') || new Date().toISOString().slice(0,10);
     status.textContent='['+(done+1)+'/'+all.length+'] '+f.name+' \u2014 \u062c\u0627\u0631\u064a \u062c\u0644\u0628 NDVI...';
-    const ndviRes = await wFetchNDVIForFarm(f.lat, f.lng, cropKey, irrType, plantDate);
+    const ndviRes = await wFetchNDVIForFarm(f.lat, f.lng, cropKey, irrType, plantDate, f);
     f._ndviKc  = ndviRes.kc;
     f._ndviVal = ndviRes.ndvi;
     f._ndviSrc = ndviRes.source;
@@ -1664,10 +1679,19 @@ function wCalcFarm(f, et0Global, gIrr, gPlant, gCrop, irrEff, fedM2){
     c2GrossTotal  = Math.round(c2GrossPerFed * aFed);
   }
 
-  // NDVI-based estimate — use live fetched value first, then smart estimate, then W_GEE static
-  var ndviKc = f._ndviKc || ndviToKc(wEstimateNDVI(cropKey, plantDate, irrType));
-  var ndviVal= f._ndviVal || wEstimateNDVI(cropKey, plantDate, irrType);
-  var ndviSrc= f._ndviSrc || '🤖 تقدير ذكي FAO-Egypt';
+  // NDVI-based estimate — priority: 1) user manual override 2) live fetched 3) smart estimate
+  var ndviOverride = fs.ndviOverride!=null ? parseFloat(fs.ndviOverride) : null;
+  var ndviKc, ndviVal, ndviSrc, ndviIsOverride=false;
+  if(ndviOverride!=null && !isNaN(ndviOverride) && ndviOverride>0 && ndviOverride<=1){
+    ndviVal = ndviOverride;
+    ndviKc  = ndviToKc(ndviOverride);
+    ndviSrc = '✏️ يدوي (محرر)';
+    ndviIsOverride = true;
+  } else {
+    ndviKc  = f._ndviKc  || ndviToKc(wEstimateNDVI(cropKey, plantDate, irrType));
+    ndviVal = f._ndviVal || wEstimateNDVI(cropKey, plantDate, irrType);
+    ndviSrc = f._ndviSrc || '🤖 تقدير ذكي FAO-Egypt';
+  }
   var ndviPerFed    = +wGetSeasonTotalKc(ndviKc, et0, FED, cropKey);
   var ndviGrossPerFed = Math.round(ndviPerFed/(irrEff/100));
   var ndviGrossTotal  = Math.round(ndviGrossPerFed * aFed);
@@ -1692,13 +1716,84 @@ function wCalcFarm(f, et0Global, gIrr, gPlant, gCrop, irrEff, fedM2){
     faoPerFed:faoPerFed, faoGrossPerFed:faoGrossPerFed, faoGrossTotal:faoGrossTotal,
     c2PerFed:c2PerFed, c2GrossPerFed:c2GrossPerFed, c2GrossTotal:c2GrossTotal,
     ndviKc:ndviKc, ndviVal:ndviVal, ndviSrc:ndviSrc,
-    ndviReal:f._ndviReal||false, ndviGEE:f._ndviGEE||false,
+    ndviReal:f._ndviReal||false, ndviGEE:f._ndviGEE||false, ndviIsOverride:ndviIsOverride,
     ndviPerFed:ndviPerFed, ndviGrossPerFed:ndviGrossPerFed, ndviGrossTotal:ndviGrossTotal,
     age:age, dLeft:dLeft, stageName:stageName, kcToday:kcToday, etcToday:etcToday,
     totalEvents:totalEvents, irrEffAdj:irrEffAdj, cropDur:cropDur,
     diffPerFed: faoGrossPerFed - ndviGrossPerFed
   };
 }
+
+// ── NDVI Sources Panel builder ────────────────────────────
+function wBuildNDVIPanel(f, r){
+  var fid = f.id;
+  var sources = f._ndviSources || [];
+  var srcColors = {s2:'#1B5E20', ol:'#1565c0', np:'#E65100', sm:'#6d4c41'};
+  var srcBg    = {s2:'#e8f5e9', ol:'#e3f2fd', np:'#fff3e0', sm:'#efebe9'};
+  var srcKeys  = ['s2','ol','np','sm'];
+
+  var srcHtml = sources.length
+    ? sources.map(function(src, i){
+        var k   = srcKeys[i] || 'sm';
+        var has = src.res != null;
+        var ndv = has ? src.res.ndvi.toFixed(3) : '—';
+        var kc  = has ? src.res.kc.toFixed(3)   : '—';
+        var isActive = has && src.res.source === r.ndviSrc && !r.ndviIsOverride;
+        return '<div style="flex:1;min-width:130px;background:'+(has?srcBg[k]:'#f5f5f5')+
+          ';border:1.5px solid '+(isActive?(srcColors[k]||'#888'):'#ddd')+
+          ';border-radius:8px;padding:7px 10px;opacity:'+(has?1:0.5)+'">' +
+          '<div style="font-size:10px;font-weight:700;color:'+(has?srcColors[k]:'#aaa')+';margin-bottom:3px">'+src.label+'</div>'+
+          '<div style="font-size:13px;font-weight:700;color:'+(has?'#212121':'#aaa')+'">NDVI = '+ndv+'</div>'+
+          '<div style="font-size:11px;color:#555">Kc = '+kc+'</div>'+
+          (isActive ? '<div style="font-size:9px;margin-top:3px;color:'+srcColors[k]+';font-weight:700">✔ مستخدم حالياً</div>' : '')+
+          (has && !isActive && !r.ndviIsOverride
+            ? '<button onclick="wApplyNDVISource(\''+fid+'\','+src.res.ndvi+')" style="margin-top:4px;font-size:9px;padding:2px 7px;background:#fff;border:1px solid '+(srcColors[k]||'#888')+';color:'+(srcColors[k]||'#888')+';border-radius:4px;cursor:pointer">استخدم هذا</button>'
+            : '')+
+        '</div>';
+      }).join('')
+    : '<div style="color:#aaa;font-size:11px;padding:8px">اضغط "Fetch Live ET₀ + NDVI" لجلب القيم من الأقمار الاصطناعية</div>';
+
+  var clearBtn = r.ndviIsOverride
+    ? '<button onclick="wClearNDVIOverride(\''+fid+'\')" style="padding:4px 10px;background:#fff;color:#e53935;border:1px solid #e53935;border-radius:6px;font-size:11px;cursor:pointer">✕ مسح التعديل</button>'
+    : '';
+
+  return '<div style="padding:10px 14px 0;border-top:1px solid #e8eaf6">'+
+    '<div style="font-size:11px;font-weight:700;color:#37474f;margin-bottom:6px">🛰️ مصادر NDVI — الأقمار الأربعة</div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">'+srcHtml+'</div>'+
+    '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;background:#f3e5f5;border-radius:8px;padding:7px 10px;margin-bottom:8px">'+
+      '<span style="font-size:11px;color:#6a1b9a;font-weight:700">✏️ تعديل يدوي:</span>'+
+      '<input id="ndviEdit_'+fid+'" type="number" min="0.01" max="1" step="0.001" value="'+r.ndviVal.toFixed(3)+'" style="width:80px;padding:3px 7px;border:1.5px solid #ce93d8;border-radius:6px;font-size:12px"/>'+
+      '<button onclick="wSaveNDVIOverride(\''+fid+'\',document.getElementById(\'ndviEdit_'+fid+'\').value)" style="padding:4px 12px;background:#8e24aa;color:#fff;border:none;border-radius:6px;font-size:11px;cursor:pointer">💾 حفظ</button>'+
+      clearBtn+
+      '<span style="font-size:10px;color:#888">القيمة الحالية: NDVI=<b>'+r.ndviVal.toFixed(3)+'</b> → Kc=<b>'+r.ndviKc.toFixed(3)+'</b></span>'+
+    '</div>'+
+  '</div>';
+}
+
+// ── NDVI manual override helpers ──────────────────────────
+function wSaveNDVIOverride(farmId, val){
+  var v = parseFloat(val);
+  if(isNaN(v)||v<=0||v>1){ showToast('NDVI لازم يكون بين 0 و 1','#e65100'); return; }
+  wSetFarmSetting(farmId,'ndviOverride',v);
+  // Also update in-memory farm object
+  var f = getAllFarms().find(function(x){return x.id===farmId;});
+  if(f){ f._ndviKc=ndviToKc(v); f._ndviVal=v; f._ndviSrc='✏️ يدوي (محرر)'; f._ndviReal=true; f._ndviGEE=false; }
+  wCalcAll();
+  showToast('✅ NDVI='+(+v.toFixed(3))+' محفوظ للمزرعة','#2e7d32',2500);
+}
+function wClearNDVIOverride(farmId){
+  var settings = wLoadFarmSettings();
+  if(settings[farmId]) delete settings[farmId].ndviOverride;
+  wSaveFarmSettingsStore(settings);
+  var f = getAllFarms().find(function(x){return x.id===farmId;});
+  if(f){ delete f._ndviKc; delete f._ndviVal; delete f._ndviSrc; delete f._ndviReal; delete f._ndviGEE; }
+  wCalcAll();
+  showToast('تم مسح التعديل اليدوي — رجع للقيمة الآلية','#888',2500);
+}
+function wApplyNDVISource(farmId, ndviVal){
+  wSaveNDVIOverride(farmId, ndviVal);
+}
+// ──────────────────────────────────────────────────────────
 
 function wCalcAll(){
   var container = document.getElementById('wResults');
@@ -1798,7 +1893,7 @@ function wCalcAll(){
               '<td style="padding:5px 8px;font-weight:700;font-size:13px;color:#2e7d32">'+r.ndviGrossTotal.toLocaleString()+' m³</td>' +
               '<td style="padding:5px 8px;color:#555">Kc='+r.ndviKc.toFixed(3)+'</td>' +
               '<td style="padding:5px 8px;color:#555">'+r.irrEffAdj+'%</td>' +
-              '<td style="padding:5px 8px;font-size:10px;color:'+(r.ndviGEE?'#1B5E20':r.ndviReal?'#1565c0':'#E65100')+'">'+
+              '<td style="padding:5px 8px;font-size:10px;color:'+(r.ndviIsOverride?'#6a1b9a':r.ndviGEE?'#1B5E20':r.ndviReal?'#1565c0':'#E65100')+'">'+
                 'NDVI='+r.ndviVal.toFixed(3)+'<br><span style="opacity:.8">'+r.ndviSrc+'</span></td>' +
             '</tr>' +
             (r.diffPerFed!==0?'<tr style="background:#fffde7"><td style="padding:4px 8px;color:#e65100;font-size:11px" colspan="2">± Diff FAO vs NDVI</td>'+
@@ -1809,6 +1904,8 @@ function wCalcAll(){
           '</tbody>' +
         '</table>' +
         '</div>' +
+        // ── NDVI Sources Panel ──────────────────────────────────
+        wBuildNDVIPanel(f, r) +
       '</div>' +
     '</div>';
   });
@@ -4397,138 +4494,224 @@ function fzImportPolygonsForFarm(event){
   reader.readAsText(file,'UTF-8');
 }
 
-// ─── Bulk import (large spatial files) ──────────────────────
 function fzOpenImportDialog(){
-  document.getElementById('fzImportDialog').style.display='block';
+  var farms = getAllFarms();
+  var farmOpts = farms.map(function(f){
+    var sel = f.id === fzActiveFarmId ? ' selected' : '';
+    return '<option value="'+f.id+'"'+sel+'>'+(f.name||f.nameEn||f.id)+'</option>';
+  }).join('');
+
+  var dialog = document.getElementById('fzImportDialog');
+  dialog.innerHTML =
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">'+
+      '<div style="font-size:13px;font-weight:700;color:#1565c0">📂 Import Polygons (GeoJSON / KML / CSV)</div>'+
+      '<button onclick="document.getElementById(\'fzImportDialog\').style.display=\'none\'" style="background:#fce4ec;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;color:#c62828;font-weight:700">✕</button>'+
+    '</div>'+
+    '<div style="font-size:11px;color:#666;margin-bottom:10px">Each polygon/feature becomes a separate zone. Supports GeoJSON, KML, CSV (lat/lng).</div>'+
+    // Farm selector
+    '<div style="margin-bottom:10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">'+
+      '<label style="font-size:12px;font-weight:600;color:#333">📍 Assign to farm:</label>'+
+      (farms.length
+        ? '<select id="fzImportFarmSel" style="padding:5px 10px;border:1.5px solid #90caf9;border-radius:7px;font-size:12px;min-width:200px">'+
+            '<option value="">-- no farm (bulk import) --</option>'+farmOpts+
+          '</select>'
+        : '<span style="color:#e65100;font-size:11px">⚠️ No farms yet — add a farm first, or import will save without farm link.</span>')+
+    '</div>'+
+    // Buttons
+    '<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">'+
+      '<label class="btn btn-primary" style="cursor:pointer;font-size:12px">'+
+        '📂 GeoJSON / JSON'+
+        '<input type="file" accept=".geojson,.json" style="display:none" onchange="fzBulkImport(event,\'geojson\')"/>'+
+      '</label>'+
+      '<label class="btn btn-info" style="cursor:pointer;font-size:12px">'+
+        '🌍 KML'+
+        '<input type="file" accept=".kml" style="display:none" onchange="fzBulkImport(event,\'kml\')"/>'+
+      '</label>'+
+      '<label class="btn btn-teal" style="cursor:pointer;font-size:12px">'+
+        '📊 CSV (lat,lng)'+
+        '<input type="file" accept=".csv" style="display:none" onchange="fzBulkImport(event,\'csv\')"/>'+
+      '</label>'+
+    '</div>'+
+    '<div id="fzImportProgress" style="margin-top:6px;font-size:12px;color:#1565c0;display:none"></div>';
+
+  dialog.style.display = 'block';
+  dialog.scrollIntoView({behavior:'smooth', block:'nearest'});
 }
 
 async function fzBulkImport(event, fmt){
   var file = event.target.files[0]; if(!file) return;
+
+  // Get selected farm from dialog selector (or fall back to active farm)
+  var selEl = document.getElementById('fzImportFarmSel');
+  var targetFarmId = (selEl && selEl.value) ? selEl.value : (fzActiveFarmId || null);
+
   var prog = document.getElementById('fzImportProgress');
   var summary = document.getElementById('fzBulkSummary');
-  prog.style.display='block';
-  prog.textContent='⏳ Reading file ('+Math.round(file.size/1024/1024,1)+' MB)...';
+  if(!prog) return;
+  prog.style.display = 'block';
+  prog.innerHTML = '⏳ Reading <b>'+file.name+'</b> ('+Math.round(file.size/1024/1024*100)/100+' MB)...';
 
   var reader = new FileReader();
+  reader.onerror = function(){ prog.innerHTML = '❌ Failed to read file.'; };
   reader.onload = async function(e){
     try{
       var text = e.target.result;
       var features = [];
-      prog.textContent='⏳ Parsing...';
-      await new Promise(function(r){setTimeout(r,10);}); // yield to browser
+      prog.innerHTML = '⏳ Parsing '+fmt.toUpperCase()+'...';
+      await new Promise(function(r){setTimeout(r,10);});
 
-      if(fmt==='kml'){
-        var parser = new DOMParser();
-        var kml = parser.parseFromString(text,'text/xml');
-        var pms = kml.querySelectorAll('Placemark');
-        prog.textContent='⏳ Found '+pms.length+' placemarks...';
-        pms.forEach(function(pm){
+      // ── Parse ──
+      if(fmt === 'kml'){
+        var kmlDoc = new DOMParser().parseFromString(text, 'text/xml');
+        var parseErr = kmlDoc.querySelector('parsererror');
+        if(parseErr) throw new Error('Invalid KML: '+parseErr.textContent.slice(0,100));
+        kmlDoc.querySelectorAll('Placemark').forEach(function(pm){
           var cs = pm.querySelector('coordinates');
           if(!cs) return;
           var pts = cs.textContent.trim().split(/\s+/).map(function(s){
-            var p=s.split(','); return [parseFloat(p[0]),parseFloat(p[1])];
-          }).filter(function(p){return !isNaN(p[0])&&!isNaN(p[1]);});
-          if(pts.length>=3){ pts.push(pts[0]); features.push({geometry:{type:'Polygon',coordinates:[pts]},properties:{name:(pm.querySelector('name')||{}).textContent||''}}); }
+            var p = s.split(','); return [parseFloat(p[0]), parseFloat(p[1])];
+          }).filter(function(p){ return !isNaN(p[0]) && !isNaN(p[1]); });
+          if(pts.length >= 3){
+            if(pts[0][0]!==pts[pts.length-1][0] || pts[0][1]!==pts[pts.length-1][1]) pts.push(pts[0]);
+            features.push({
+              geometry: {type:'Polygon', coordinates:[pts]},
+              properties: {name:(pm.querySelector('name')||{}).textContent||''}
+            });
+          }
         });
-      } else if(fmt==='csv'){
-        var lines = text.split('\n').filter(function(l){return l.trim();});
-        var headers = lines[0].split(',').map(function(h){return h.replace(/"/g,'').trim().toLowerCase();});
-        for(var i=1;i<lines.length;i++){
-          var vals = lines[i].split(',');
-          var row={};
-          headers.forEach(function(h,hi){row[h]=(vals[hi]||'').replace(/"/g,'').trim();});
-          var lat=parseFloat(row.lat||row.latitude),lng=parseFloat(row.lng||row.lon||row.longitude);
-          if(!isNaN(lat)&&!isNaN(lng)){
-            var delta=0.005;
+      } else if(fmt === 'csv'){
+        var csvLines = text.split('\n').filter(function(l){ return l.trim(); });
+        if(csvLines.length < 2) throw new Error('CSV must have header + at least 1 row');
+        var headers = csvLines[0].split(',').map(function(h){ return h.replace(/"/g,'').trim().toLowerCase(); });
+        for(var ci=1; ci<csvLines.length; ci++){
+          var vals = csvLines[ci].split(',');
+          var row = {};
+          headers.forEach(function(h,hi){ row[h] = (vals[hi]||'').replace(/"/g,'').trim(); });
+          var lat = parseFloat(row.lat||row.latitude);
+          var lng = parseFloat(row.lng||row.lon||row.longitude);
+          if(!isNaN(lat) && !isNaN(lng)){
+            var delta = 0.005;
             features.push({geometry:{type:'Polygon',coordinates:[[
               [lng-delta,lat-delta],[lng+delta,lat-delta],[lng+delta,lat+delta],[lng-delta,lat+delta],[lng-delta,lat-delta]
-            ]]},properties:row});
+            ]]}, properties:row});
           }
         }
       } else {
-        var gj = JSON.parse(text);
-        features = gj.features||(gj.type==='Feature'?[gj]:[]);
+        // GeoJSON
+        var gj;
+        try{ gj = JSON.parse(text); }
+        catch(pe){ throw new Error('Invalid JSON: '+pe.message); }
+        if(!gj) throw new Error('Empty file');
+        if(gj.type === 'FeatureCollection')      features = gj.features || [];
+        else if(gj.type === 'Feature')            features = [gj];
+        else if(gj.type === 'GeometryCollection') features = (gj.geometries||[]).map(function(g){return{geometry:g,properties:{}};});
+        else if(gj.type === 'Polygon' || gj.type === 'MultiPolygon') features = [{geometry:gj,properties:{}}];
+        else features = gj.features || [];
       }
 
-      prog.textContent='⏳ Processing '+features.length+' features...';
+      if(!features.length) throw new Error('No valid polygon features found in file');
+      prog.innerHTML = '⏳ Processing <b>'+features.length+'</b> features...';
       await new Promise(function(r){setTimeout(r,10);});
 
-      // Process in chunks to avoid blocking UI
-      var allZones = await fzLoadAll();
-      var existIds = new Set(allZones.map(function(z){return z.id;}));
-      var newZones=[], chunk=500, done=0;
+      // ── Build zones ──
+      var newZones = [], done = 0, skipped = 0;
+      var chunk = 200;
 
-      for(var i=0;i<features.length;i++){
-        var feat = features[i];
-        if(!feat||!feat.geometry) continue;
-        var geoms = feat.geometry.type==='MultiPolygon'
-          ? feat.geometry.coordinates.map(function(c){return {type:'Polygon',coordinates:c};})
-          : [feat.geometry];
+      for(var fi=0; fi<features.length; fi++){
+        var feat = features[fi];
+        if(!feat || !feat.geometry){ skipped++; continue; }
+        var geoms = feat.geometry.type === 'MultiPolygon'
+          ? feat.geometry.coordinates.map(function(c){ return {type:'Polygon',coordinates:c}; })
+          : feat.geometry.type === 'Polygon' ? [feat.geometry] : [];
+
         geoms.forEach(function(geom){
-          if(geom.type!=='Polygon') return;
-          var props = feat.properties||{};
           var area = fzPolyAreaFeddans(geom);
-          if(area<0.001) return; // skip tiny/invalid
-          var farmId = fzActiveFarmId||'bulk_'+Math.random().toString(36).slice(2,6);
-          var z = fzNewZone(farmId,{
-            name: props.name||props.NAME||props.FARM_NAME||props.parcel_id||('Parcel '+(done+1)),
-            polygon: geom, area:+area.toFixed(2),
-            cropKey: props.crop||props.CROP||'wheat',
-            irrSystem: props.irr||props.irr_system||'drip',
-            notes: props.notes||''
+          if(area < 0.001){ skipped++; return; }
+          var props = feat.properties || {};
+          var fid = targetFarmId || ('bulk_'+Math.random().toString(36).slice(2,6));
+          var z = fzNewZone(fid, {
+            name:      props.name||props.NAME||props.FARM_NAME||props.parcel_id||props.id||('Zone '+(done+1)),
+            polygon:   geom,
+            area:      +area.toFixed(2),
+            cropKey:   props.crop||props.CROP||props.crop_type||'wheat',
+            irrSystem: props.irr||props.irr_system||props.irrigation||'drip',
+            plantDate: props.plant_date||props.plantDate||'',
+            notes:     props.notes||props.description||''
           });
           fzCalcSISI(z);
           newZones.push(z);
           done++;
         });
-        if(i%chunk===0){
-          prog.textContent='⏳ Processing '+i+'/'+features.length+'...';
+
+        if(fi % chunk === 0 && fi > 0){
+          prog.innerHTML = '⏳ Processing '+fi+'/'+features.length+' — <b>'+done+' zones</b>...';
           await new Promise(function(r){setTimeout(r,1);});
         }
       }
 
-      // Batch save to IDB
-      prog.textContent='💾 Saving '+newZones.length+' zones to storage...';
-      // Save in batches of 1000
-      for(var b=0;b<newZones.length;b+=1000){
-        await fzIdbSave(newZones.slice(b,b+1000));
-        prog.textContent='💾 Saved '+(Math.min(b+1000,newZones.length))+'/'+newZones.length+'...';
+      if(!newZones.length) throw new Error('No valid polygons extracted (check geometry type & coordinates)');
+
+      // ── Save to IDB ──
+      prog.innerHTML = '💾 Saving <b>'+newZones.length+'</b> zones...';
+      var batchSize = 500;
+      for(var b=0; b<newZones.length; b+=batchSize){
+        await fzIdbSave(newZones.slice(b, b+batchSize));
+        prog.innerHTML = '💾 Saved '+(Math.min(b+batchSize,newZones.length))+'/'+newZones.length+'...';
         await new Promise(function(r){setTimeout(r,5);});
       }
-      fzAllZones=null;
+      fzAllZones = null; // clear cache
       fzLsSave(newZones);
 
-      // If a farm is selected, show its zones on map
-      if(fzActiveFarmId){
-        fzActiveZones = newZones.filter(function(z){return z.farmId===fzActiveFarmId;});
+      // ── Update map if farm matches ──
+      if(targetFarmId && targetFarmId === fzActiveFarmId){
+        fzActiveZones = newZones.filter(function(z){ return z.farmId === fzActiveFarmId; });
         fzClearLayers();
         fzActiveZones.forEach(fzAddLayerForZone);
         fzRenderZonesList();
         fzUpdateTotals();
         fzFitAll();
+      } else if(targetFarmId){
+        // Switch to the imported farm automatically
+        var farmSel = document.getElementById('fzFarmSelect');
+        if(farmSel){
+          farmSel.value = targetFarmId;
+          fzSelectFarm(targetFarmId);
+        }
       }
 
-      prog.style.display='none';
-      summary.style.display='block';
-      var totalFAO=0;
-      newZones.forEach(function(z){totalFAO+=fzCalcWaterForZone(z).faoTotal;});
-      summary.innerHTML='<div style="background:#e8f5e9;border:1px solid #a5d6a7;border-radius:9px;padding:12px 16px">'+
-        '<div style="font-size:13px;font-weight:700;color:#2e7d32;margin-bottom:6px">✅ Import Complete</div>'+
-        '<div style="font-size:12px;display:flex;gap:16px;flex-wrap:wrap">'+
-          '<span>📦 Features: <b>'+features.length+'</b></span>'+
-          '<span>✅ Zones created: <b>'+newZones.length+'</b></span>'+
-          '<span>💧 Total FAO Water: <b>'+totalFAO.toLocaleString()+' m³</b></span>'+
-        '</div>'+
-        '<div style="font-size:11px;color:#666;margin-top:5px">All zones saved to browser storage (IndexedDB). Select a farm to view on map.</div>'+
-      '</div>';
-      showToast('✅ '+newZones.length+' zones imported','#2e7d32',5000);
-    }catch(err){
-      prog.textContent='❌ Error: '+err.message;
-      showToast('Import error: '+err.message,'#e65100',6000);
+      // ── Summary ──
+      prog.style.display = 'none';
+      document.getElementById('fzImportDialog').style.display = 'none';
+
+      var totalFAO = 0;
+      newZones.forEach(function(z){ totalFAO += fzCalcWaterForZone(z).faoTotal; });
+      var farmName = targetFarmId ? (getAllFarms().find(function(f){return f.id===targetFarmId;})||{}).name||targetFarmId : 'No farm';
+
+      if(summary){
+        summary.style.display = 'block';
+        summary.innerHTML =
+          '<div style="background:#e8f5e9;border:1px solid #a5d6a7;border-radius:9px;padding:12px 16px;margin-top:8px">'+
+          '<div style="font-size:13px;font-weight:700;color:#2e7d32;margin-bottom:8px">✅ Import Complete</div>'+
+          '<div style="display:flex;gap:14px;flex-wrap:wrap;font-size:12px;margin-bottom:6px">'+
+            '<span>📦 Features in file: <b>'+features.length+'</b></span>'+
+            '<span>✅ Zones created: <b>'+newZones.length+'</b></span>'+
+            (skipped?'<span style="color:#e65100">⚠️ Skipped: <b>'+skipped+'</b></span>':'')+
+            '<span>💧 FAO water: <b>'+totalFAO.toLocaleString()+' m³</b></span>'+
+            '<span>🏡 Farm: <b>'+farmName+'</b></span>'+
+          '</div>'+
+          '<div style="font-size:11px;color:#666">Zones saved to IndexedDB. Map updated automatically.</div>'+
+          '</div>';
+      }
+      showToast('✅ '+newZones.length+' zones imported → '+farmName, '#2e7d32', 5000);
+
+    } catch(err){
+      prog.style.display = 'block';
+      prog.innerHTML = '<span style="color:#e65100">❌ Error: '+err.message+'</span>';
+      showToast('Import failed: '+err.message, '#e65100', 8000);
     }
-    event.target.value='';
+    event.target.value = '';
   };
-  reader.readAsText(file,'UTF-8');
+  reader.readAsText(file, 'UTF-8');
 }
 
 // ─── Export ───────────────────────────────────────────────────
